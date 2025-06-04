@@ -1,10 +1,12 @@
 import logging
 import queue
+import struct
 
 from .state import data_queue, data_queue_raw, event_queue
 from . import config
 
 logger = logging.getLogger(__name__)
+_unpack_from = struct.unpack_from
 
 def parser():
     """
@@ -12,93 +14,119 @@ def parser():
     according with protocol and enqueue in data_queue.
     """
     buffer = bytearray()
+    state = 0 # 0: Searching header, 1: Wait length
+    idx = None
+    read_idx = 0 # Pointer for memory handle
+    num_samples = None
+    total_size = None
+
+    # Constants
+    shutdown_cmd = config.SHUT_DOWN_COMMAND
+    max_buffer_size = config.MAX_BUFFER_SIZE
+    packet_header = config.PACKET_HEADER # 00 00 00 02
+    header_size = config.HEADER_SIZE # 4 + 4 = 8 bytes
+    length_tag = config.LENGTH_TAG # 03
+    sample_tag = config.SAMPLE_TAG # 05
+    sample_unit_size = config.SAMPLE_UNIT_SIZE # 4 bytes
+    queue_timeout = config.QUEUE_PUT_TIMEOUT
+
+
+    # For validate sample tags
+    step = sample_unit_size
+    start = header_size
+    tag_offset = step - 1
 
     while True:
         # 1) Get next chunk, block until receive it
         chunk = data_queue_raw.get()
-        if chunk is config.SHUT_DOWN_COMMAND:
-            logger.info(f"Shutdown signal received: {config.SHUT_DOWN_COMMAND}. Exiting from parser.")
+        if chunk is shutdown_cmd:
+            logger.info(f"Shutdown signal received: {shutdown_cmd}. Exiting from parser.")
             break
-
+        
         buffer.extend(chunk)
 
+        # Delete buffer only when size is more than buffer size / 2
+        if read_idx > max_buffer_size // 2:
+            del buffer[:read_idx]
+            read_idx = 0
+
         # 2) Prevent buffer growing without control
-        if len(buffer) > config.MAX_BUFFER_SIZE:
+        if len(buffer) > max_buffer_size:
             logger.warning("Buffer too big. Cleaning previous data.")
-            buffer = buffer[-config.MAX_BUFFER_SIZE:]
+            buffer = buffer[-max_buffer_size:]
 
         # 3) Try extract all complete packets
         while True:
-            idx = buffer.find(config.PACKET_HEADER)
-            if idx == -1:
-                # No header in buffer
-                break
+            if state == 0:
+                if len(buffer) - read_idx < len(packet_header):
+                    break  # Wait for more data
 
-            # We have HEADER_SIZE bytes next to header?
-            if len(buffer) < idx + config.HEADER_SIZE:
-                # Wait next chunk
-                break
-
-            # Validate length tag byte
-            tag_byte = buffer[idx + len(config.PACKET_HEADER) + 3]
-            if tag_byte != config.LENGTH_TAG:
-                logger.warning("Invalid length-tag in parser; deleting one byte.")
-                del buffer[idx]
-                continue
-
-            # Exctract number of samples (3 bytes LSB)
-            num_samples = int.from_bytes(
-                buffer[idx + len(config.PACKET_HEADER): idx + len(config.PACKET_HEADER) + 3],
-                byteorder='little'
-            ) + 1 # Numero de muestras mas 1
-            total_size = config.HEADER_SIZE + num_samples * config.SAMPLE_UNIT_SIZE
-
-            # We have complete packet?
-            if len(buffer) < idx + total_size:
-                # Wait for more notifications
-                break
-
-            # Extract complete packet
-            packet = bytes(buffer[idx: idx + total_size])
-            # Remove processed data
-            del buffer[: idx + total_size]
-
-            # 4) Validate sample tag byte
-            pos = config.HEADER_SIZE
-            valid = True
-            for i in range(num_samples):
-                sample_tag_index = pos + (config.SAMPLE_UNIT_SIZE - 1)
-                sample_tag = packet[sample_tag_index]
-                if sample_tag != config.SAMPLE_TAG:
-                    logger.warning(
-                        f"Invalid sample-tag in sample {i}: "
-                        f"found 0x{sample_tag:02x}, "
-                        f"expected 0x{config.SAMPLE_TAG:02x}. Discarted packet."
-                    )
-                    valid = False
+                idx = buffer.find(packet_header, read_idx)
+                if idx == -1:
+                    # No header in buffer
                     break
-                pos += config.SAMPLE_UNIT_SIZE
-            if not valid:
-                # Next posible packet
-                continue
+                state = 1
+            elif state == 1:
+                # We have HEADER_SIZE bytes next to header?
+                if len(buffer) < idx + header_size:
+                    # Wait next chunk
+                    break
+                
+                # Unpack 4 bytes little-endian and calculate number of samples
+                value32, = _unpack_from('<I', buffer, idx + len(packet_header))
+                tag = (value32 >> 24) & 0xFF
+                length = value32 & 0xFFFFFF
 
-            # 5) Enqueue complete packet
-            try:
-                data_queue.put(packet, timeout=config.QUEUE_PUT_TIMEOUT)
-            except queue.Full:
-                event_queue.put("data_queue_full")
-            except Exception as e:
-                logger.exception(f"Error in enqueue complete packet: {e}")
+                if tag != length_tag:
+                    logger.warning("Invalid length-tag; discarting header")
+                    read_idx = idx + len(packet_header)
+                    state = 0
+                    idx = None
+                    continue
+
+                num_samples = length + 1
+                total_size = header_size + num_samples * sample_unit_size
+                state = 2
+
+            elif state == 2:
+                # We have complete packet?
+                if len(buffer) < idx + total_size:
+                    # Wait for more notifications
+                    break
+
+                # Extract complete packet
+                packet = bytes(buffer[idx: idx + total_size])
+
+                # Validate sample tag byte
+                tag_slice = buffer[
+                    idx + start + tag_offset 
+                    : idx + start + step * num_samples 
+                    : step
+                ]
+
+                if tag_slice != bytes([sample_tag] * num_samples):
+                    logger.warning("Invalid sample tag. Discarting packet")
+                    read_idx = idx + total_size
+                    state = 0
+                    idx = None
+                    num_samples = None
+                    total_size = None
+                    continue
+
+                read_idx = idx + total_size
+                # Enqueue complete packet
+                try:
+                    data_queue.put(packet, timeout=queue_timeout)
+                except queue.Full:
+                    event_queue.put("data_queue_full")
+                except Exception as e:
+                    logger.exception(f"Error in enqueue complete packet: {e}")
+
+                # Reset state after enqueue one complete an valid packet
+                state = 0
+                idx = None
+                num_samples = None
+                total_size = None
+
 
     logger.info("Parser thread finished succesfully")
-
-
-
-
-
-        
-        
-
-                
-
-

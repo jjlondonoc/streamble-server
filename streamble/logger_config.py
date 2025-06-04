@@ -33,4 +33,4 @@ def setup_logger(log_to_console: bool = False, verbose: bool = False):
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
-    logger.debug("Logger configured succesfully")
+    logger.info("Logger configured succesfully")

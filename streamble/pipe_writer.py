@@ -35,7 +35,6 @@ def pipe_writer(pipe: pywintypes.HANDLE, shutdown_event: threading.Event):
             try:
                 data = data_queue.get(timeout=0.5)
             except queue.Empty:
-                time.sleep(0.01)
                 continue  # Check shutdown again
             # Try write in pipe. 
             # If fails, finish connection server.

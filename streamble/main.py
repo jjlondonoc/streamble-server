@@ -4,35 +4,35 @@ import asyncio
 import pywintypes
 from bleak import BleakClient
 
+from . import logger_config
 from . import config
 from . import pipe_writer
 from . import ble_client
 from . import packets_parser
 from . import state
 
-logging.basicConfig(
-    level= logging.INFO,
-    format= '[%(asctime)s] %(levelname)s - %(message)s'
-)
+logger_config.setup_logger(log_to_console=False, verbose=False)
 logger = logging.getLogger(__name__)
 
 async def main():
+    logger.info("Server started")
     # 1. Create pipe and wait until client connection:
     try:
         pipe = pipe_writer.create_pipe_connection(config.PIPE_NAME)
+        logger.info("Pipe connected")
     except (BrokenPipeError, pywintypes.error) as e:
-            logger.warning(f"Pipe error: {e}")
+            logger.error(f"Pipe error: {e}")
 
     # 2. When client connected, launch pipe_writer_thread
     pipe_writer_thread = threading.Thread(target=pipe_writer.pipe_writer, args=(pipe, state.shutdown_event,))
     pipe_writer_thread.daemon = True
     pipe_writer_thread.start()
 
-    # 3. When pipe connected and thread launched, scann BLE devices
+    # 3. When pipe connected and thread launched, scan BLE devices
     device_address = await ble_client.connect_ble_device(config.DEVICE_NAME, config.SCAN_TIMEOUT)
     if not device_address:
         # If device is not found, finish server session
-        logger.warning(f"Device {config.DEVICE_NAME} not found")
+        logger.critical(f"Device {config.DEVICE_NAME} not found")
         logger.info("Stopping server session")
         logger.info("Stopping threads and disposing resources")
         state.shutdown_event.set() # Stop pipe_writer thread
@@ -91,7 +91,7 @@ async def main():
                     await ble_client.send_command(client, config.START_COMMAND, config.COMMAND_CHAR_UUID)
 
                 elif event == "ble_disconnected":
-                    logger.warning("BLE device unexpectedly disconnected. Stopping server session")
+                    logger.critical("BLE device unexpectedly disconnected. Stopping server session")
                     state.shutdown_event.set() # Detiene el hilo del pipe_writer
                     break
 
@@ -103,12 +103,10 @@ async def main():
         logger.info("Stopping threads and disposing resources")
         pipe_writer.close_pipe(pipe)
         pipe_writer_thread.join()
-        # Ya se detuvo solo el hilo del pipe_writer
-        # El hilo del parser está bloqueado esperando datas de data_queue_raw
-        # Como ya detuve al periférico, se va a quedar ahí esperando datos en la cola
-        # Así que envío la señal de shutdown en la cola data_queue_raw
+        # pipe_writer thread finished automatically
+        #shutdown signal for stop parser thread
         if parser_thread:
-            state.data_queue_raw.put(config.SHUT_DOWN_COMMAND) # Con esto cierro el hilo del parser
+            state.data_queue_raw.put(config.SHUT_DOWN_COMMAND) # Close parser thread (shutdown command)
             parser_thread.join()
         logger.info("Session finished succesfully")
 
